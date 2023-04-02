@@ -1,0 +1,729 @@
+---
+title: "Analysis of Serum Metabolomes in Dogs with Exocrine Pancreatic Insufficiency"
+output: html_notebook
+---
+
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo = F, message=FALSE, warning=FALSE)
+
+library(knitr)
+library(dplyr)
+library(pheatmap)
+library(fgsea)
+library(factoextra)
+library(EnhancedVolcano) 
+library(rstatix)
+library(tidyr)
+library(corrr)
+library(RColorBrewer)
+library(viridis)
+library(visdat)
+library(purrr)
+library(ggpubr)
+library(qvalue)
+library(FactoMineR)
+library(reshape2)
+library(ggforce)
+library(reticulate)
+library(arsenal)
+library(gtools)
+library(mixOmics)
+library(multcomp)
+library(ggplus)
+library(Hmisc)
+
+#set plotting colors for Healthy vs EPI
+plot_cols <- c("royalblue", "orange")
+
+```
+
+# **LOAD DATA**
+
+## **SAMPLE METADATA**
+
+```{r}
+baseline_clinicVar <- read.csv("k9EPI_baseline_clinicVars.csv", row.names = 1)
+
+baseline_clinicVar <- baseline_clinicVar[, -1]
+
+baseline_clinicVar$Group <- factor(baseline_clinicVar$Group, levels = c("Healthy", "EPI"))
+
+#groups for the serummetabolome data
+EPI_groups <- read.csv("K9EPI_groups.csv", row.names = 1)
+
+EPI_groups$Group <- factor(EPI_groups$Group, levels = c("Healthy", "EPI"))
+
+
+```
+
+How many dogs are in each group for the whole investigation?
+
+```{r}
+table(baseline_clinicVar$Group)
+```
+
+## **SERUM METABOLOMES**
+
+```{r, include=F}
+metab <- read.csv("K9EPI_serumMetab.csv", row.names = 1)
+
+```
+
+How many metabolites are contained in these data?
+
+```{r}
+paste("The (untargeted) serum metabolite dataset contains", nrow(metab), "named biochemicals")
+```
+
+## **METABOLITE ANNOTATION**
+
+```{r, include=F}
+#load metabolite annotation 
+annot <- read.csv("K9EPI_metabAnnotation.csv", row.names = 1)
+
+annot$SUPER.PATHWAY <- as.factor(annot$SUPER.PATHWAY)
+
+length(levels(annot$SUPER.PATHWAY))
+
+annot$SUB.PATHWAY <- as.factor(annot$SUB.PATHWAY)
+
+```
+
+```{r}
+paste("Serum metabolites are distributed among", length(levels(annot$SUPER.PATHWAY)), "super-pathways.", sep = " ")
+```
+
+```{r}
+super <- data.frame(table(annot$SUPER.PATHWAY))
+
+names(super) <- c("Super Pathway", "Count")
+
+#super <- super %>% arrange(desc(Count))
+
+ggplot(data = super, aes(x= reorder(`Super Pathway`, -Count), y = Count, fill = `Super Pathway`)) + 
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(legend.position="right") + 
+  theme(legend.title=element_text(size=12), 
+    legend.text=element_text(size=10)) +
+  labs(x="Metabolic Super-Pathway") +
+  theme(axis.text.x=element_blank()) +
+  ggtitle("Distribution of Serum Metabolites in Metabolic Super-Pathways")
+```
+
+# **ANALYZING DEMOGRAPHIC AND CLINICAL VARIABLES**
+
+## **Demographic Variables**
+
+### **Age**
+
+Assess distribution of "age" with histogram and Shapiro-Wilk test
+
+```{r}
+hist(baseline_clinicVar$Age, main = "Distribution of Age")
+shapiro_test(baseline_clinicVar$Age)
+```
+
+Summary and inferential statistics for age, breed, and reproductive status:
+
+```{r, results='asis'}
+
+summary(tableby(Group ~ anova(Age) + Breed + Sex, data = baseline_clinicVar, 
+                numeric.stats=c("mean", "sd", "median","min", "max")))
+```
+
+There are significant differences in age, breed, or reproductive status between EPI dogs and healthy controls.
+
+### **Clinical Signs**
+
+```{r, results='asis'}
+summary(tableby(Group ~ Diarrhea + Weight + Vomiting + Appetite, 
+                data = baseline_clinicVar[baseline_clinicVar$Group != "Healthy", ]))
+```
+
+## **Medication History**
+
+```{r, results='asis'}
+summary(tableby(Group ~ Metronidazole + Tylosin + Cobalamin_sup + Folate_sup + Antacids + Probiotics, 
+                data = baseline_clinicVar[baseline_clinicVar$Group != "Healthy", ]))
+
+```
+
+### **Serum cTLI**
+
+```{r}
+hist(baseline_clinicVar$Serum_cTLI, main = "Distrubition of Serum cTLI")
+
+shapiro.test(baseline_clinicVar$Serum_cTLI)
+#major violoation of normality
+```
+
+Major violation of normality for cTLI. Is it resolved with log-transformation?
+
+```{r}
+hist(log(baseline_clinicVar$Serum_cTLI), main = "Distrubition of Serum log(cTLI)")
+
+shapiro.test(log(baseline_clinicVar$Serum_cTLI))
+
+```
+
+Log transformation does not resolve violation. Use non-parametric Wilcoxon test. 
+
+```{r, results='asis'}
+summary(tableby(Group ~ Serum_cTLI,
+                data = baseline_clinicVar, 
+                numeric.test="wt", 
+                numeric.stats=c("mean", "sd", "median", "min", "max", "iqr", "q1q3")))
+
+```
+
+```{r}
+
+tli <- ggplot(baseline_clinicVar, aes(x=Group, y=Serum_cTLI, fill = Group)) + 
+  geom_boxplot() +
+  stat_compare_means(comparisons = list(c("Healthy", "EPI")), 
+                     label = "p.signif", 
+                     method = "t.test") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  scale_fill_manual(values = plot_cols) +
+  theme_bw() +
+  labs(y="Serum cTLI (µg/L)", x = "")
+
+tli
+```
+
+Serum cTLI varies significantly between groups and the EPI dogs have lower serum concentrations of cTLI compared with healthy controls. As expected. 
+
+### **Serum Cobalamin**
+
+Dogs receiving cobalamin supplementation at the time of sample collection were removed for this analysis.
+
+```{r}
+
+baseline_clinicVar[!baseline_clinicVar$Cobalamin_sup == "Yes", "Serum_Cobalamin"] %>% 
+  hist(main = "Distribution of Serum Cobalamin")
+
+baseline_clinicVar[!baseline_clinicVar$Cobalamin_sup == "Yes", "Serum_Cobalamin"] %>% 
+  shapiro.test()
+
+```
+
+Though SW test is not violated, the histogram appears skewed, use wt. 
+
+```{r, results='asis'}
+
+summary(tableby(Group ~ Serum_Cobalamin,
+                data = baseline_clinicVar[!baseline_clinicVar$Cobalamin_sup == "Yes", ],
+                numeric.test="wt",
+                numeric.stats=c("mean", "sd", "median", "min", "max", "iqr", "q1q3")))
+
+```
+
+Serum cobalamin varies significantly by group and is lower in the dogs with EPI compared with healthy controls. 
+
+```{r}
+b12 <- ggplot(baseline_clinicVar[!baseline_clinicVar$Cobalamin_sup == "Yes", ], aes(x=Group, y=Serum_Cobalamin, fill = Group)) + 
+  geom_boxplot() +
+  stat_compare_means(comparisons = list(c("Healthy", "EPI")), 
+                     label = "p.signif", 
+                     method = "t.test") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  scale_fill_manual(values = plot_cols) +
+  theme_bw() +
+  labs(y="Serum Cobalamin (ng/L)", x="")
+
+b12
+  
+```
+
+### **Serum Folate**
+
+Dogs receiving folate supplementation at the time of sample collection were removed for this analysis.
+
+```{r}
+baseline_clinicVar[!baseline_clinicVar$Folate_sup == "Yes", "Serum_Folate"] %>% 
+  hist(main = "Distribution of Serum Folate")
+
+baseline_clinicVar[!baseline_clinicVar$Folate_sup == "Yes", "Serum_Folate"] %>% 
+  shapiro.test()
+
+```
+
+The distribution of serum folate is approximately normal. 
+
+```{r, results='asis'}
+summary(tableby(Group ~ Serum_Folate,
+                data = baseline_clinicVar[!baseline_clinicVar$Folate_sup == "Yes", ], 
+                numeric.test="anova",
+                numeric.stats=c("mean", "sd", "median", "min", "max")))
+
+```
+
+There are no significant differences in serum folate concentrations between dogs with EPI and healthy controls.
+
+```{r}
+folate <- ggplot(baseline_clinicVar[!baseline_clinicVar$Folate_sup == "Yes", ], 
+                 aes(x=Group, y=Serum_Folate, fill = Group)) + 
+  geom_boxplot() +
+  stat_compare_means(comparisons = list(c("Healthy", "EPI")), 
+                     label = "p.signif", 
+                     method = "t.test") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  scale_fill_manual(values = plot_cols) +
+  theme_bw() +
+  scale_fill_manual(values = plot_cols) +
+  labs(y="Serum Folate (µg/L)", x="") +
+  ggtitle("Serum Folate")
+
+folate
+  
+```
+
+# **UNSUPERVISED ANALYSIS**
+
+All metabolite concentrations were log-transformed prior to analysis.
+
+```{r}
+metab_log <- log(metab)
+
+metab_log <- data.frame(t(metab_log))
+```
+
+## **PRINCIPAL COMPONENT ANALYSIS**
+
+
+```{r, include=F}
+
+#prepare data
+metab_pca <- metab_log
+
+metab_pca$Group <- EPI_groups$Group[match(rownames(metab_pca), rownames(EPI_groups))]
+table(metab_pca$Group)
+metab_pca$Group <- factor(metab_pca$Group, levels = c("Healthy", "EPI"))
+
+```
+
+```{r}
+#perform PCA
+pca <- PCA(metab_log[, -760], graph = F, scale.unit = T)
+
+fviz_eig(pca)
+
+summary(pca)
+
+```
+
+```{r}
+
+pc <- data.frame(cbind(PC1=pca$ind$coord[, 1], PC2=pca$ind$coord[, 2]))
+pc$Group <- EPI_groups$Group[match(rownames(pc), EPI_groups$Sample_ID)]
+
+pca_plot <- ggplot(data = pc, aes(x = PC1, y = PC2, color = Group)) +
+  scale_color_manual(values = plot_cols) +
+  geom_hline(yintercept = 0, lty = 2) +
+  geom_vline(xintercept = 0, lty = 2) +
+  guides(color = guide_legend(title = "Group")) +
+  scale_shape_manual(values = c(15, 16, 16, 17, 18)) +
+  geom_point(alpha = 1, size = 3) + 
+  xlab("PC 1 (11.5%)") + 
+  ylab("PC 2 (9.9%)") +
+  theme_minimal() +
+  theme_bw() + 
+  theme(legend.title=element_text(size=14), 
+    legend.text=element_text(size=12))
+
+```
+
+
+## **HEATMAP WITH CLUSTERING BY EUCLIDIAN DISTANCES**
+
+```{r}
+
+metab_heat <- metab_log
+
+metab_heat$Group <- EPI_groups$Group[match(rownames(metab_heat), rownames(EPI_groups))]
+
+annotation_colors <- list(Group = c(Healthy = "royalblue", EPI = "orange"))
+
+annotation_col <- as.data.frame(metab_heat$Group)
+
+names(annotation_col)[1] <- "Group"
+
+rownames(annotation_col) <- rownames(metab_heat)
+
+metab_heat <- metab_heat[, -760]
+metab_heat <- data.frame(t(metab_heat))
+
+ph <- pheatmap(
+  mat               = metab_heat,
+  color             = inferno(10),
+  border_color      = NA,
+  show_colnames     = T,
+  annotation_col    = annotation_col,
+  annotation_colors = annotation_colors,
+  cluster_cols = T,
+  cluster_rows = T,
+  drop_levels       = TRUE,
+  scale             = "row",
+  fontsize          = 8,
+  annotation_legend = F, 
+  fontsize_row = 5,
+  fontsize_col = 5,
+  show_rownames = F,
+  treeheight_row = 0,
+
+)
+
+
+
+```
+# **DIFFERENTIAL ANALYSIS OF RELATIVE METABOLITE CONCENTRATIONS**
+
+## **T-TESTS**
+
+Welch's t-test will be performed on each serum metabolite to identify those that vary significantly betweem dogs with EPI and healthy controls. The log2-fold difference in means for each metabolite will be caclulated to estimate the effect size. FDR-adjusted p-values (q-values) will be calculated using the BH method.  
+
+```{r, include=F}
+
+metab_log$Group <- EPI_groups$Group[match(rownames(metab_log), rownames(EPI_groups))]
+
+
+t_test.res <- lapply(metab_log[, -760],
+       function(x)
+         t.test(x ~ metab_log$Group, paired = F)
+)
+
+pval <- sapply(t_test.res, '[[', 'p.value') %>%
+  as.data.frame(row.names = names(metab_log[, -760]))
+
+names(pval)[1] <- paste("P-value")
+
+#calculate FDR-corrected p-value
+padj <- t(pval) %>%
+  p.adjust(method = "BH", n = nrow(pval)) %>%
+  as.data.frame(row.names = names(metab_log[, -760]))
+
+names(padj)[1] <- paste("pval_adj_BH")
+
+p_table_t <- cbind(pval, padj)
+
+sig_table_t <- na.omit(p_table_t[p_table_t$`P-value` < 0.05, ])
+
+sig_table_t$Biochemical <- annot$BIOCHEMICAL[match(rownames(sig_table_t), rownames(annot))]
+
+```
+
+How many metabolites varied significantly (P<0.05)?
+
+```{r}
+
+paste(nrow(sig_table_t), "metabolites varied significantly (P<0.05) between dogs with EPI and healthy dogs", sep = " ")
+```
+
+How many metabolites had a low FDR (FDR<0.2)?
+
+```{r}
+
+paste(nrow(p_table_t[p_table_t$pval_adj_BH <0.2, ]), 
+      "significantly variable metabolites had a FDR<0.2")
+
+```
+
+## **log2 Fold-Changes**
+
+```{r, include=F}
+
+metab_means <- metab %>% t() %>% data.frame() %>%
+  mutate_if(is.numeric, log2) %>%
+  mutate(Group=EPI_groups$Group) %>% 
+  group_by(Group) %>%
+   dplyr::summarise(across(
+    .cols = is.numeric, 
+    .fns = list(Mean = mean), 
+    na.rm = T, 
+    .names = "{col}_{fn}"
+    ))
+
+metab_means <- metab_means[c(2:1), ]
+
+names <- colnames(metab_means)[2:760]
+nNames <- length(names)
+
+foldchange.res <- NULL
+
+for (i in names) {
+  # print status
+  #print(paste("Running entity:", i, "which is", which(names==i), "out of", nNames))
+  name <- i
+   
+  fc1 <- data.frame(metab_means[1,i] - metab_means[2,i])
+  fc1$contrast <- "EPI - Healthy"
+  names(fc1)[1] <- "Fold-Change"
+  fc1$met <- i
+  
+  foldchange.res <- rbind(foldchange.res, fc1)
+
+}
+
+foldchange.res$met <- gsub("_Mean", "", foldchange.res$met)
+
+```
+
+## **INDENTIFY SIGNIFICANTLY VARIABLE METABOLITES**
+
+```{r, include=F}
+
+p_table_t$met <- rownames(p_table_t)
+combined.res <- cbind(p_table_t, foldchange.res) 
+
+combined.res <- combined.res[, c(3, 5, 1:2, 4)]
+
+combined.res$Biochemical <- annot$BIOCHEMICAL[match(combined.res$met, 
+                                                     rownames(annot))]
+
+combined.res$SuperPathway <- annot$SUPER.PATHWAY[match(combined.res$met,
+                                                       rownames(annot))]
+
+combined.res$SubPathway <- annot$SUB.PATHWAY[match(combined.res$met, 
+                                                    rownames(annot))]
+
+combined.res <- combined.res[, c(1, 6:8, 2:5)]
+
+names(combined.res)[6:8] <- c("pval", "FDR", "log2FC")
+```
+
+
+```{r}
+sig <- combined.res[combined.res$FDR <0.2, ]
+sig <- sig[order(sig$SuperPathway, sig$log2FC), ]
+
+sig$log2FC <- round(sig$log2FC, 2)
+sig$pval <- round(sig$pval, 3)
+sig$FDR <- round(sig$FDR, 3)
+
+sig_inc <- sig[sig$log2FC > 0, ]
+rownames(sig_inc) <- c()
+
+sig_dec <- sig[sig$log2FC < 0, ]
+rownames(sig_dec) <- c()
+
+inc <- as.data.frame(table(sig_inc$SuperPathway))
+names(inc)[1] <- "SuperPathway"
+names(inc)[2] <- "Increased Metabolites"
+
+paste(sum(inc$`Increased Metabolites`),
+      "significantly variable metabolites were INCREASED in the sera of dogs with EPI")
+
+
+
+dec <- as.data.frame(table(sig_dec$SuperPathway))
+names(dec)[1] <- "SuperPathway"
+names(dec)[2] <- "Decreased Metabolites"
+
+paste(sum(dec$`Decreased Metabolites`),
+      "significantly variable metabolites were DECREASED in the sera of dogs with EPI")
+
+
+```
+
+```{r}
+
+inc2 <- inc
+names(inc2)[2] <- "Significant_Changes"
+inc2$color <- "Increased"
+inc2 <- inc2[!inc2$Significant_Changes == 0, ]
+
+dec2 <- dec
+names(dec2)[2] <- "Significant_Changes"
+dec2$color <- "Decreased"
+dec2 <- dec2[!dec2$Significant_Changes == 0, ]
+
+freq_tbl <- rbind(inc2, dec2)
+
+freq_tbl$color <- factor(freq_tbl$color, 
+                           levels = c("Increased", "Decreased"))
+
+freq_tbl <-freq_tbl[order(-freq_tbl$Significant_Changes), ]
+
+super_path.plot <- ggplot(data = freq_tbl, aes(y = Significant_Changes, 
+                                               x = reorder(SuperPathway, -Significant_Changes, sum), 
+                                               fill = color)) + 
+  geom_bar(stat = "identity") + 
+  labs(fill = "") +
+  xlab("") +
+  ylab("Number of Significant Metabolites") + 
+  scale_fill_brewer(palette="Set1") +
+  theme_bw() +
+  theme(legend.position = "right") + theme(legend.title.align=0.5) +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+
+super_path.plot
+```
+
+Plot all statistically significant (FDR<0.2) serum metabolites
+
+```{r, include=F}
+
+sig_metab <- metab_log
+
+keep <- c(sig$met, "Group")
+
+sig_metab <- sig_metab[, keep]
+
+names(sig_metab)[1:114] <- annot$BIOCHEMICAL[match(names(sig_metab[1:114]),
+                                                   rownames(annot))] 
+
+base_plot2 <-sig_metab %>%
+  gather(Measure, Value, -Group) %>%
+  ggplot(aes(x = factor(Group), y = Value, fill = Group)) +
+  geom_boxplot() +
+  theme(plot.title = element_text(size = 6)) +
+  scale_fill_manual(values = plot_cols) +
+  facet_wrap(~Measure, 
+             scales = "free") +
+  xlab("Group") +
+  ylab("Relative Metabolite Concentration (Log, Median-Scaled))") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  theme(strip.text.x = element_text(size = 5))
+
+
+pdf("S_Fig_sigBoxplots.pdf")
+facet_multiple(base_plot2, "Measure",
+               ncol = 3,
+               scales = "free")
+dev.off()
+
+
+```
+
+Table of all significant metabolites with FDR<0.2 and a large effect size (|log2FC|>0.06; >1.5 fold difference in means)
+
+```{r}
+
+sig <- sig %>% arrange(SuperPathway, SubPathway, log2FC, FDR)
+
+kable(sig[sig$FDR<0.2 & abs(sig$log2FC)>0.6,
+          c(2:4, 6:8)], row.names = F)
+
+```
+
+
+```{r}
+#Output results
+
+names(combined.res)[7] <- "qval"
+
+##all t.test results
+write.csv(combined.res, "K9EPI_serumMetab_ttest_res.csv")
+
+#significant results (p<0.05)
+write.csv(sig, "K9EPI_serumMetab_ttest_sigres.csv")
+```
+
+
+# **METABOLITE SET ENRICHMENT ANALYSIS**
+
+
+Adapted from gene set enrichment analysis using the gsea package. 
+
+ * Rank metabolites by the product of the log2FC and log(p-val) from the t-test
+ * The top end of the list are highly significant AND have high positive fold change
+ * The bottom end of the list are highly significant AND have negative fold change
+ * gsea function used to detect significant enrichement of metabolic sub-pathways among significant results
+ * calculated normalized enrichment score 
+
+```{r, include=F}
+
+diff_enrich <- combined.res
+
+diff_enrich$rank <- -log(diff_enrich$pval)*diff_enrich$log2FC
+
+diff_enrich <- diff_enrich[order(diff_enrich$rank, decreasing = T), ]
+
+#create ranking vector from product of log2FC*pval
+
+rank <- diff_enrich[, 9]
+names(rank) <- diff_enrich$Biochemical
+# head(rank)
+# tail(rank)
+
+#Now generate lists of metabolites in each metabolic sub-pathway
+
+pathways <- diff_enrich[, 2:4]
+
+pathways <- pathways[order(pathways$SubPathway, pathways$Biochemical),]
+
+#pathways$Biochemical <- as.character(pathways$Biochemical)
+pathways$SubPathway <- as.character(pathways$SubPathway)
+
+pathways <- split(pathways$Biochemical, as.character(pathways$SubPathway))
+
+class(pathways)
+
+set.seed(123)
+fgseaRes <- fgsea(pathways = pathways, 
+                  stats = rank,
+                  minSize=2,
+                  maxSize=20)
+
+
+#saveRDS(fgseaRes, "K9EPI_serumMetab_pathways_res.RDS")
+
+```
+
+```{r}
+fgseaRes_out <- data.frame(fgseaRes)
+
+names(fgseaRes_out)[3] <- "qval"
+
+fgseaRes_out <- apply(fgseaRes_out,2,as.character)
+
+write.csv(fgseaRes_out, file = "fgseaRes.csv")
+```
+
+Plot normalized pathway enrichment scores
+
+```{r}
+
+topPathwaysUp <- fgseaRes[ES > 0][head(order(padj), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+
+
+topPathways <- unlist(topPathways)
+
+fgseaRes_top20 <- fgseaRes[fgseaRes$pathway %in% topPathways, ]
+
+fgseaRes_top20 <- fgseaRes_top20[order(fgseaRes_top20$NES), ]
+
+fgseaRes_top20$pathway <- as.factor(fgseaRes_top20$pathway)
+
+fgseaRes_top20$pathway <- factor(fgseaRes_top20$pathway, 
+                                 levels = fgseaRes_top20$pathway[order(fgseaRes_top20$NES)])
+
+gsea_plot <- ggplot(data = fgseaRes_top20, aes(y = fgseaRes_top20$NES, 
+                                               x = fgseaRes_top20$pathway, 
+                                               fill  = ifelse(fgseaRes_top20$padj 
+                                                             <0.2, 
+                                                             "FDR q<0.2",
+                                                             "FDR q≥0.2"))) +
+  geom_bar(stat = "identity", position = "dodge") + ylim(-3, 3) + 
+  ylim(-2, 2) +
+  coord_flip() + 
+  labs(fill = "") +
+  xlab("") +
+  ylab("Normalized Enrichment Score") +
+  scale_fill_manual(values=c("orange", "grey")) +
+  theme_bw() +
+  theme(legend.position = "bottom") + theme(legend.title.align=0.5)
+      
+gsea_plot
+
+
+```
+
+
+
